@@ -5,9 +5,15 @@
 (define-constant err-unauthorized (err u103))
 (define-constant err-invalid-transfer (err u104))
 (define-constant err-pending-dispute (err u105))
+(define-constant err-lease-exists (err u106))
+(define-constant err-lease-not-found (err u107))
+(define-constant err-lease-expired (err u108))
+(define-constant err-invalid-lease (err u109))
+(define-constant err-payment-failed (err u110))
 
 (define-data-var next-land-id uint u1)
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-lease-id uint u1)
 
 (define-map lands
     { land-id: uint }
@@ -58,6 +64,26 @@
 (define-map land-transactions
     { land-id: uint }
     { transaction-count: uint }
+)
+
+(define-map leases
+    { lease-id: uint }
+    {
+        land-id: uint,
+        lessor: principal,
+        lessee: principal,
+        monthly-rent: uint,
+        start-block: uint,
+        end-block: uint,
+        total-payments: uint,
+        last-payment-block: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-map land-lease-mapping
+    { land-id: uint }
+    { active-lease-id: (optional uint) }
 )
 
 (define-public (register-land (location (string-ascii 100)) (size uint) (land-type (string-ascii 50)) (value uint))
@@ -161,6 +187,83 @@
         )
         (asserts! (is-eq (get owner land-data) tx-sender) err-unauthorized)
         (map-delete usage-rights { land-id: land-id, user: user })
+        (ok true)
+    )
+)
+
+(define-public (create-lease (land-id uint) (lessee principal) (monthly-rent uint) (duration-blocks uint))
+    (let
+        (
+            (land-data (unwrap! (map-get? lands { land-id: land-id }) err-not-found))
+            (lease-id (var-get next-lease-id))
+            (current-block stacks-block-height)
+            (end-block (+ current-block duration-blocks))
+            (existing-lease (map-get? land-lease-mapping { land-id: land-id }))
+        )
+        (asserts! (is-eq (get owner land-data) tx-sender) err-unauthorized)
+        (asserts! (not (has-pending-dispute land-id)) err-pending-dispute)
+        (asserts! (> duration-blocks u0) err-invalid-lease)
+        (asserts! (> monthly-rent u0) err-invalid-lease)
+        (asserts! (or (is-none existing-lease) (is-none (get active-lease-id (unwrap! existing-lease err-lease-exists)))) err-lease-exists)
+        (map-set leases
+            { lease-id: lease-id }
+            {
+                land-id: land-id,
+                lessor: tx-sender,
+                lessee: lessee,
+                monthly-rent: monthly-rent,
+                start-block: current-block,
+                end-block: end-block,
+                total-payments: u0,
+                last-payment-block: u0,
+                status: "active"
+            }
+        )
+        (map-set land-lease-mapping { land-id: land-id } { active-lease-id: (some lease-id) })
+        (var-set next-lease-id (+ lease-id u1))
+        (ok lease-id)
+    )
+)
+
+(define-public (make-lease-payment (lease-id uint))
+    (let
+        (
+            (lease-data (unwrap! (map-get? leases { lease-id: lease-id }) err-lease-not-found))
+            (current-block stacks-block-height)
+            (blocks-per-month u4320)
+            (rent-amount (get monthly-rent lease-data))
+        )
+        (asserts! (is-eq tx-sender (get lessee lease-data)) err-unauthorized)
+        (asserts! (is-eq (get status lease-data) "active") err-invalid-lease)
+        (asserts! (<= current-block (get end-block lease-data)) err-lease-expired)
+        (try! (stx-transfer? rent-amount tx-sender (get lessor lease-data)))
+        (map-set leases
+            { lease-id: lease-id }
+            (merge lease-data {
+                total-payments: (+ (get total-payments lease-data) rent-amount),
+                last-payment-block: current-block
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (terminate-lease (lease-id uint))
+    (let
+        (
+            (lease-data (unwrap! (map-get? leases { lease-id: lease-id }) err-lease-not-found))
+            (current-block stacks-block-height)
+            (land-id (get land-id lease-data))
+        )
+        (asserts! (or (is-eq tx-sender (get lessor lease-data)) (is-eq tx-sender (get lessee lease-data))) err-unauthorized)
+        (map-set leases
+            { lease-id: lease-id }
+            (merge lease-data {
+                status: "terminated",
+                end-block: current-block
+            })
+        )
+        (map-set land-lease-mapping { land-id: land-id } { active-lease-id: none })
         (ok true)
     )
 )
@@ -301,5 +404,43 @@
                 acc
             )
         acc
+    )
+)
+
+(define-read-only (get-lease (lease-id uint))
+    (map-get? leases { lease-id: lease-id })
+)
+
+(define-read-only (get-active-lease-by-land (land-id uint))
+    (match (map-get? land-lease-mapping { land-id: land-id })
+        mapping-data
+            (match (get active-lease-id mapping-data)
+                active-id (map-get? leases { lease-id: active-id })
+                none
+            )
+        none
+    )
+)
+
+(define-read-only (is-lease-active (lease-id uint))
+    (match (map-get? leases { lease-id: lease-id })
+        lease-data
+            (and 
+                (is-eq (get status lease-data) "active")
+                (<= stacks-block-height (get end-block lease-data))
+            )
+        false
+    )
+)
+
+(define-read-only (get-lease-payment-info (lease-id uint))
+    (match (map-get? leases { lease-id: lease-id })
+        lease-data
+            (ok {
+                total-payments: (get total-payments lease-data),
+                last-payment-block: (get last-payment-block lease-data),
+                monthly-rent: (get monthly-rent lease-data)
+            })
+        err-lease-not-found
     )
 )
